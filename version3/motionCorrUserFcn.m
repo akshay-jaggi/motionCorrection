@@ -239,7 +239,7 @@ if (tNow - s.tLastCorrection) < s.minMoveInterval_s,    MCORR_STATE = s; return;
 % Non-blocking post-move quiet period: suppress the next correction
 % for postMoveQuiet_s after a moveSample so the controller settles.
 % (Never use pause() inside a frameAcquired callback — it blocks
-% ScanImage's acquisition pipeline and causes frame drops.)
+% ScanImages acquisition pipeline and causes frame drops.)
 if (tNow - s.tLastMove) < s.postMoveQuiet_s,             MCORR_STATE = s; return; end
 if s.bufCount < s.minFramesForCorr,                      MCORR_STATE = s; return; end
 % Cannot command moves if we never got a baseline position.
@@ -326,8 +326,17 @@ end
 
 trustZ = ~zAtBoundary && ~zAmbiguous;
 
-% --- XY estimate (refine): phase correlation vs best-matching Z ref -
-refImg = ref.featureImages{bi};
+% --- XY estimate (refine): phase correlation vs the z=0 reference -
+% Use ref.zeroIdx (NOT ref.featureImages{bi}). The z=0 reference defines
+% the operational rest position; every other Z slice in the stack carries
+% its own small XY offset from sample tilt, piezo-axis misalignment, and
+% optical aberrations during the z-sweep. Refining against ref{bi} bakes
+% those per-slice offsets into the XY command and walks the stage away
+% from the true rest XY whenever bi drifts off ref.zeroIdx. Phase
+% correlation is robust to the structural difference between focal planes
+% at small Z offsets, so refining against ref{zeroIdx} is both correct
+% (preserves the XY zero) and reliable.
+refImg = ref.featureImages{ref.zeroIdx};
 [dy_pix, dx_pix] = phaseCorrShift(avgFrame, refImg, s.maxShift_pix);
 dx_um = dx_pix * ref.pixelSizeXY_um(1);    % cols  → image X
 dy_um = dy_pix * ref.pixelSizeXY_um(2);    % rows  → image Y
