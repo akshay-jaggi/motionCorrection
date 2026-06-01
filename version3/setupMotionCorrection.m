@@ -61,7 +61,7 @@ function setupMotionCorrection(hSI, refStack, varargin)
 %  Do not use the joystick during a corrected run; stop/restart acquisition
 %  if you need to reposition manually.
 
-global MCORR_REF MCORR_STATE
+global MCORR_REF MCORR_STATE MCORR_FRAMEBUF MCORR_FRAMETIMES
 
 p = inputParser;
 addParameter(p,'targetPlaneZ_um',     [],   @(x) isempty(x)||isnumeric(x));
@@ -102,8 +102,6 @@ MCORR_STATE = struct( ...
     'enabled',              true, ...
     'targetPlaneZ_um',      o.targetPlaneZ_um, ...
     'zSeen',                [], ...     % for auto-detect
-    'frameBuffer',          zeros([refStack.imSize, bufSize], 'single'), ...
-    'frameTimes',           zeros(1, bufSize), ...
     'bufferSize',           bufSize, ...
     'bufIdx',               0, ...
     'bufCount',             0, ...
@@ -134,11 +132,20 @@ MCORR_STATE = struct( ...
     'verbose',              o.verbose, ...
     'cumCorr',              [0 0 0]);
 
+% Frame ring buffer lives in separate top-level globals so that per-frame
+% indexed writes (MCORR_FRAMEBUF(:,:,idx) = feat) are in-place and never
+% trigger MATLAB's copy-on-write on the main state struct. At typical
+% frame rates (30 Hz, bufSize ~300), the frameBuffer alone is ~113 MB;
+% copying it inside MCORR_STATE every frame was causing the
+% "Data logging lags behind acquisition" frame-drop error.
+MCORR_FRAMEBUF   = zeros([refStack.imSize, bufSize], 'single');
+MCORR_FRAMETIMES = zeros(1, bufSize);
+
 % JIT pre-warm: call featureImage once now so MATLAB compiles the
 % imgaussfilt/imgradient path before the first frameAcquired fires.
 % Without this the very first callback invocation is ~10x slower and
 % can cause ScanImage to drop a frame.
-if refStack.rIdx && refStack.cIdx
+if ~isempty(refStack.rIdx) && ~isempty(refStack.cIdx)
     dummy = zeros(numel(refStack.rIdx), numel(refStack.cIdx), 'single');
     jitWarm_(dummy, refStack.useFeatureImage);
 end

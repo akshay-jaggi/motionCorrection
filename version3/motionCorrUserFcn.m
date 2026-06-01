@@ -35,7 +35,7 @@ function motionCorrUserFcn(src, evt, varargin)
 %  With these signs, positive image drift produces a positive corrective
 %  motor command on the anti-parallel axis (reverses the drift).
 
-global MCORR_REF MCORR_STATE
+global MCORR_REF MCORR_STATE MCORR_FRAMEBUF MCORR_FRAMETIMES
 if isempty(MCORR_STATE) || ~MCORR_STATE.enabled || isempty(MCORR_REF), return; end
 
 hSI = src.hSI;
@@ -149,12 +149,15 @@ end
 % Push to ring buffer (store the cropped feature, not the full raw frame)
 tNow = toc(s.tRef);
 s.bufIdx   = mod(s.bufIdx, s.bufferSize) + 1;
-% Resize buffer on first use to feature-image size (smaller, faster)
-if size(s.frameBuffer,1) ~= size(feat,1) || size(s.frameBuffer,2) ~= size(feat,2)
-    s.frameBuffer = zeros([size(feat), s.bufferSize], 'single');
+% Resize global buffer on first use if feature image is smaller than imSize
+% (should only happen once per session after first valid frame)
+if size(MCORR_FRAMEBUF,1) ~= size(feat,1) || size(MCORR_FRAMEBUF,2) ~= size(feat,2)
+    MCORR_FRAMEBUF   = zeros([size(feat), s.bufferSize], 'single');
+    MCORR_FRAMETIMES = zeros(1, s.bufferSize);
 end
-s.frameBuffer(:,:,s.bufIdx) = feat;
-s.frameTimes(s.bufIdx)      = tNow;
+% In-place indexed write to top-level global — no struct COW, no 113 MB copy.
+MCORR_FRAMEBUF(:,:,s.bufIdx) = feat;
+MCORR_FRAMETIMES(s.bufIdx)   = tNow;
 s.bufCount = min(s.bufCount + 1, s.bufferSize);
 
 % ================================================================
@@ -174,9 +177,8 @@ if s.bufCount < s.minFramesForCorr,                      MCORR_STATE = s; return
 if isempty(s.cachedMotorPos),                            MCORR_STATE = s; return; end
 
 % Average frames whose timestamps fall within the last avgDuration_s
-mask = s.frameTimes(1:s.bufferSize) > (tNow - s.avgDuration_s) & ...
-       s.frameTimes(1:s.bufferSize) <= tNow & ...
-       (1:s.bufferSize) <= s.bufCount + 0;   % only valid slots
+mask = MCORR_FRAMETIMES(1:s.bufferSize) > (tNow - s.avgDuration_s) & ...
+       MCORR_FRAMETIMES(1:s.bufferSize) <= tNow;
 mask = mask(:);
 % Restrict to slots actually written
 written = false(s.bufferSize,1);
@@ -190,7 +192,7 @@ nUsed = nnz(mask);
 if nUsed < max(3, round(s.minFramesForCorr/2))
     MCORR_STATE = s; return;
 end
-avgFrame = mean(s.frameBuffer(:,:,mask), 3);
+avgFrame = mean(MCORR_FRAMEBUF(:,:,mask), 3);
 
 if s.verbose
     fprintf('\n[MotionCorr @ %5.0f s]  %d frames in last %.0f s — computing drift...\n', ...
