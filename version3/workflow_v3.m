@@ -5,7 +5,7 @@
 %    - Disable FastZ (multi-plane).  In ScanImage GUI: FastZ Controls → uncheck.
 %    - Pick the plane you want to keep stable (typically the deeper/structural one).
 hSI = evalin('base','hSI');
-hSI.hFastZ.enable = false;     % belt-and-braces
+%hSI.hFastZ.enable = false;     % belt-and-braces
 hSI.startFocus();
 
 % Verify a frame is reachable on your reference channel (e.g. structural / red = 2)
@@ -27,10 +27,16 @@ refStack = acquireRefStack(hSI, ...
 hSI.abort();                      % leave focus mode
 
 %% 3) Re-enable 2-plane / 2-channel acquisition exactly as you normally use it
-hSI.hFastZ.enable = true;
+%hSI.hFastZ.enable = true;
 % (restore your piezo waveform / FastZ settings here)
 
 %% 4) Configure the motion-correction state
+% --- scope-specific axis calibration ----------------------------
+% Image cols (X) map to motor Y; image rows (Y) map to motor X.
+% Both image axes are anti-parallel to their motor counterpart:
+%   +image_x drift → motor_y decreased  → correct with +motor_y  → ySign=-1
+%   +image_y drift → motor_x decreased  → correct with +motor_x  → xSign=-1
+%   +z-stack shift → motor_z increased  → correct with -motor_z  → zSign=+1
 setupMotionCorrection(hSI, refStack, ...
     'targetPlaneZ_um',      [], ...     % [] = auto-detect deeper plane
     'correctionInterval_s', 60, ...
@@ -43,12 +49,6 @@ setupMotionCorrection(hSI, refStack, ...
     'gainZ',                0.5, ...
     'dryRun',               true, ...   % <<< SET TO false ONCE TIMING LOOKS GOOD
     'diag',                 true, ...   % print per-phase timing at acqModeDone
-    % --- scope-specific axis calibration ----------------------------
-    % Image cols (X) map to motor Y; image rows (Y) map to motor X.
-    % Both image axes are anti-parallel to their motor counterpart:
-    %   +image_x drift → motor_y decreased  → correct with +motor_y  → ySign=-1
-    %   +image_y drift → motor_x decreased  → correct with +motor_x  → xSign=-1
-    %   +z-stack shift → motor_z increased  → correct with -motor_z  → zSign=+1
     'xSign',               -1, ...
     'ySign',               -1, ...
     'zSign',                1);
