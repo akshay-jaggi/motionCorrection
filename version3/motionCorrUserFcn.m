@@ -47,6 +47,7 @@ switch evt.EventName
         s.tRef            = tic;
         s.tLastCorrection = -inf;
         s.tLastMove       = -inf;
+        s.lastDz_um       = 0;
         s.bufIdx          = 0;
         s.bufCount        = 0;
         s.zSeen           = [];
@@ -268,21 +269,52 @@ if s.verbose
 end
 
 % --- Z estimate: NCC over full reference stack ------------------
-v = avgFrame(:); v = v - mean(v); nv = norm(v);
+% XY-first ordering (default): first phase-correlate against the z=0
+% reference image to get an approximate XY shift, integer-shift the
+% avg frame to remove gross XY drift, then run Z NCC on the aligned
+% image. Phase correlation is far more tolerant of Z mismatch than NCC
+% magnitude is to XY shift, so this single pre-alignment dramatically
+% sharpens the Z NCC peak and eliminates the cross-axis ambiguity that
+% causes alternating max-step Z oscillation and one-sided runaway.
+if s.xyFirst
+    [dy0, dx0] = phaseCorrShift(avgFrame, ref.featureImages{ref.zeroIdx}, s.maxShift_pix);
+    zSearchFrame = circshift(avgFrame, [round(dy0), round(dx0)]);
+else
+    zSearchFrame = avgFrame;
+end
+
+v = zSearchFrame(:); v = v - mean(v); nv = norm(v);
 if nv < 1e-6, s.tLastCorrection = tNow; MCORR_STATE = s; return; end
 v = single(v / nv);
 corrVec = ref.refFlat' * v;                 % [nZ × 1]
 [peakNCC, bi] = max(corrVec);
 
+% --- Z confidence checks ----------------------------------------
+% (1) Stack-boundary rejection: argmax at index 1 or nZ means the true
+%     Z is outside the calibrated range and the parabolic refinement is
+%     ill-defined. Skip Z (but still allow XY) and warn.
+zAtBoundary = (bi == 1 || bi == ref.nZ);
+
+% (2) Peak unambiguity: require the global peak to exceed the best
+%     runner-up OUTSIDE a ±2-step neighborhood by at least zPeakMargin.
+%     Catches the bistable-stack case that drives alternating max-step
+%     oscillation.
+nbhd = false(ref.nZ,1);
+nbhd(max(1,bi-2):min(ref.nZ,bi+2)) = true;
+runner = max(corrVec(~nbhd));
+if isempty(runner), runner = -inf; end
+peakMargin = peakNCC - runner;
+zAmbiguous = peakMargin < s.zPeakMargin;
+
 if peakNCC < s.minNCC_correction
     if s.verbose
-        fprintf('  peak NCC %.3f < %.3f — skipping.\n', peakNCC, s.minNCC_correction);
+        fprintf('  peak NCC %.3f < %.3f — skipping cycle entirely.\n', peakNCC, s.minNCC_correction);
     end
     s.tLastCorrection = tNow; MCORR_STATE = s; return;
 end
 
 zEst = ref.zOffsets_um(bi);
-% Parabolic sub-step Z refinement
+% Parabolic sub-step Z refinement (skip at boundary)
 if bi > 1 && bi < ref.nZ
     c1 = corrVec(bi-1); c2 = corrVec(bi); c3 = corrVec(bi+1);
     d  = 2*(c1 - 2*c2 + c3);
@@ -292,7 +324,9 @@ if bi > 1 && bi < ref.nZ
     end
 end
 
-% --- XY estimate: phase correlation vs best-matching Z reference -
+trustZ = ~zAtBoundary && ~zAmbiguous;
+
+% --- XY estimate (refine): phase correlation vs best-matching Z ref -
 refImg = ref.featureImages{bi};
 [dy_pix, dx_pix] = phaseCorrShift(avgFrame, refImg, s.maxShift_pix);
 dx_um = dx_pix * ref.pixelSizeXY_um(1);    % cols  → image X
@@ -302,12 +336,34 @@ dy_um = dy_pix * ref.pixelSizeXY_um(2);    % rows  → image Y
 % NOTE: image cols (dx_um) drive motor Y; image rows (dy_um) drive motor X.
 % xSign/ySign are -1 on this scope (each image axis is anti-parallel to its
 % motor axis); zSign is +1.
-dz = clampDB( -s.gainZ  * zEst  * s.zSign,  s.deadband_z_um,  s.maxStep_z_um  );
+if trustZ
+    dz = clampDB( -s.gainZ  * zEst  * s.zSign,  s.deadband_z_um,  s.maxStep_z_um  );
+else
+    dz = 0;
+end
 dy = clampDB( -s.gainXY * dx_um * s.ySign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-col → motorY
 dx = clampDB( -s.gainXY * dy_um * s.xSign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-row → motorX
 
+% --- Anti-oscillation guard (Z only) ---------------------------
+% If the previous Z move was clamped at max AND this cycle wants to
+% move at full clamp in the OPPOSITE direction, suppress this Z move.
+% One stalled cycle is far better than an infinite ping-pong; if the
+% reversal is genuine it will still command again next cycle.
+zClamp = s.maxStep_z_um - 1e-6;
+if dz ~= 0 && abs(s.lastDz_um) >= zClamp && abs(dz) >= zClamp && sign(dz) ~= sign(s.lastDz_um)
+    if s.verbose
+        fprintf('  *** Z oscillation guard: prev %+.2f µm, this %+.2f µm — suppressing.\n', ...
+            s.lastDz_um, dz);
+    end
+    dz = 0;
+end
+
 if s.verbose
-    fprintf('  Z:      est %+.2f µm  cmd %+.2f  NCC=%.3f  ref %d/%d\n', zEst, dz, peakNCC, bi, ref.nZ);
+    zStatus = '';
+    if zAtBoundary, zStatus = [zStatus ' [boundary]']; end
+    if zAmbiguous,  zStatus = [zStatus sprintf(' [ambig margin=%.3f<%.3f]', peakMargin, s.zPeakMargin)]; end
+    fprintf('  Z:      est %+.2f µm  cmd %+.2f  NCC=%.3f (margin %+.3f) ref %d/%d%s\n', ...
+        zEst, dz, peakNCC, peakMargin, bi, ref.nZ, zStatus);
     fprintf('  motorY (imgX): est %+.2f µm  cmd %+.2f  (%+.2f px)\n', dx_um, dy, dx_pix);
     fprintf('  motorX (imgY): est %+.2f µm  cmd %+.2f  (%+.2f px)\n', dy_um, dx, dy_pix);
 end
@@ -319,6 +375,7 @@ if abs(dx)+abs(dy)+abs(dz) > 0
             fprintf('  [DRY RUN] would move X%+.2f Y%+.2f Z%+.2f µm — not commanded.\n', dx, dy, dz);
         end
         s.tLastMove = tNow;   % still respect quiet-period gate
+        s.lastDz_um = dz;     % track in dry run too for accurate diagnostics
     else
         try
             % MP285 safety: do NOT query samplePosition here. Use the cached
@@ -334,6 +391,7 @@ if abs(dx)+abs(dy)+abs(dz) > 0
             s.tLastMove      = tNow;
             s.cachedMotorPos = newPos;        % only update on success
             s.cumCorr        = s.cumCorr + [dx dy dz];
+            s.lastDz_um      = dz;            % anti-oscillation tracker
             if s.verbose
                 fprintf('  motor moved  X%+.2f Y%+.2f Z%+.2f µm  | cumulative X%+.1f Y%+.1f Z%+.1f\n', ...
                     dx, dy, dz, s.cumCorr);
