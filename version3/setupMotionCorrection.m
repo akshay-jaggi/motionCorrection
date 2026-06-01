@@ -27,7 +27,39 @@ function setupMotionCorrection(hSI, refStack, varargin)
 %  'gainZ'                        0.5       Proportional gain for Z  (0..1)
 %  'maxShift_pix'                 50        XY phase-corr search radius (px)
 %  'xSign','ySign','zSign'        +1        Flip to -1 if a correction worsens drift
+%  'minMoveInterval_s'            30        Hard floor between motor commands (s).
+%                                           Enforced in addition to
+%                                           correctionInterval_s. Protects the
+%                                           MP-285 from frequent-command lockup.
+%  'postMoveQuiet_s'              0.5       Pause after each moveSample so the
+%                                           controller has guaranteed settle time
+%                                           before any other code path can talk
+%                                           to it.
 %  'verbose'                      true      Print per-correction diagnostics
+%
+%  ---------------------------------------------------------------------------
+%  MP-285 SAFETY NOTES
+%  ---------------------------------------------------------------------------
+%  The Sutter MP-285 is documented as having an unstable serial connection.
+%  ScanImage's docs warn that (a) frequent commands and (b) position queries
+%  while the stage is moving can lock up the controller; SI has therefore
+%  disabled its own live position updates for this device.
+%
+%  This implementation mitigates that as follows:
+%    * motorPosition is queried EXACTLY ONCE per acquisition (at acqModeStart,
+%      when the stage is guaranteed idle). The position is then cached in
+%      MCORR_STATE.cachedMotorPos and incremented by the commanded delta after
+%      each successful moveSample. No further position queries are issued.
+%    * moveSample is rate-limited by BOTH correctionInterval_s AND a hard
+%      floor (minMoveInterval_s) that cannot be defeated by mis-set params.
+%    * Each moveSample is followed by postMoveQuiet_s of pause so the
+%      controller settles before anything else can touch the serial port.
+%
+%  CAVEAT: If you move the stage via the MP-285 joystick or any non-SI path
+%  while acquisition is running, the cached position will desync. The next
+%  correction will then command an absolute target based on the stale cache.
+%  Do not use the joystick during a corrected run; stop/restart acquisition
+%  if you need to reposition manually.
 
 global MCORR_REF MCORR_STATE
 
@@ -48,6 +80,8 @@ addParameter(p,'maxShift_pix',        50,   @isnumeric);
 addParameter(p,'xSign',               1,    @isnumeric);
 addParameter(p,'ySign',               1,    @isnumeric);
 addParameter(p,'zSign',               1,    @isnumeric);
+addParameter(p,'minMoveInterval_s',   30,   @(x) isnumeric(x) && x >= 0);
+addParameter(p,'postMoveQuiet_s',     0.5,  @(x) isnumeric(x) && x >= 0);
 addParameter(p,'verbose',             true, @islogical);
 parse(p, varargin{:});
 o = p.Results;
@@ -90,6 +124,10 @@ MCORR_STATE = struct( ...
     'xSign',                o.xSign, ...
     'ySign',                o.ySign, ...
     'zSign',                o.zSign, ...
+    'minMoveInterval_s',    o.minMoveInterval_s, ...
+    'postMoveQuiet_s',      o.postMoveQuiet_s, ...
+    'cachedMotorPos',       [], ...   % populated at acqModeStart, then
+                                       % incremented by each commanded move
     'verbose',              o.verbose, ...
     'cumCorr',              [0 0 0]);
 
@@ -104,6 +142,8 @@ fprintf('  Deadbands   : Z=%.1f  XY=%.1f µm    Max step: Z=%.1f  XY=%.1f µm\n'
     o.deadband_z_um, o.deadband_xy_um, o.maxStep_z_um, o.maxStep_xy_um);
 fprintf('  Gains       : XY=%.2f  Z=%.2f       Signs: X=%+d Y=%+d Z=%+d\n', ...
     o.gainXY, o.gainZ, o.xSign, o.ySign, o.zSign);
+fprintf('  MP285 safety: min %g s between moves, %g s post-move quiet\n', ...
+    o.minMoveInterval_s, o.postMoveQuiet_s);
 fprintf('  Buffer      : %d slots\n', bufSize);
 fprintf('  Now attach motionCorrUserFcn to:\n');
 fprintf('     acqModeStart, acqModeDone, frameAcquired\n');

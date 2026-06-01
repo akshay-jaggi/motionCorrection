@@ -22,6 +22,14 @@ function refStack = acquireRefStack(hSI, varargin)
 %   - FastZ / multi-plane imaging DISABLED while this runs.
 %   - Frames available on requested channel (verify with grabCurrentFrame).
 %
+%  MP-285 SAFETY
+%   - motorPosition is queried EXACTLY ONCE (at the start, while the stage
+%     is idle). All subsequent stage targets are computed as basePos+offset
+%     — we never poll the controller during the stack acquisition.
+%   - moveSample commands are spaced by at least settleTime_s +
+%     avgDuration_s (≥ ~5 s by default), well above any "frequent command"
+%     concern. settleTime_s is floored at 0.3 s for additional safety.
+%
 %  The returned struct is the input to setupMotionCorrection().
 
 p = inputParser;
@@ -36,6 +44,14 @@ addParameter(p,'useFeatureImage',  true,       @islogical);
 addParameter(p,'savePath',         'refStack.mat', @(x) ischar(x)||isstring(x));
 parse(p, varargin{:});
 o = p.Results;
+
+% MP-285 safety floor on settle time
+if o.settleTime_s < 0.3
+    warning('acquireRefStack:settle', ...
+        'settleTime_s=%g is below the 0.3 s MP-285 safety floor; clamping to 0.3 s.', ...
+        o.settleTime_s);
+    o.settleTime_s = 0.3;
+end
 
 assert(strcmp(hSI.acqState,'focus'), ...
     'hSI must be in FOCUS mode at your reference plane. Run hSI.startFocus() first.');

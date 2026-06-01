@@ -7,6 +7,51 @@ plane and **one** channel as the reference.
 
 ---
 
+## 0. MP-285 safety (read this first)
+
+The ScanImage docs carry an explicit warning for the
+[Sutter MP-285](https://docs.scanimage.org/Configuration/Motor+Controller/SutterMP285.html):
+
+> The Sutter MP285 motion controller is known for unstable serial connection.
+> Sending frequent commands can lock up the controller. Querying the position
+> while the stage is in motion can lock up the controller. For this reason,
+> live position updates have been deactivated for Sutter MP285.
+
+v3 is built to respect this. Concretely:
+
+- **`motorPosition` is queried exactly once per acquisition**, at
+  `acqModeStart`, while the stage is guaranteed idle. The position is then
+  cached in `MCORR_STATE.cachedMotorPos` and incremented by each commanded
+  delta. The controller is never polled during steady-state imaging.
+- **Two independent rate limits gate `moveSample`**: the user-facing
+  `correctionInterval_s` (default 60 s) **and** a hard floor
+  `minMoveInterval_s` (default 30 s) that cannot be defeated by setting
+  `correctionInterval_s` too low.
+- **Every `moveSample` is followed by `postMoveQuiet_s` of `pause`**
+  (default 0.5 s) so the controller fully settles before any other code
+  path can touch the serial port.
+- **`acquireRefStack` likewise queries position once** (at startup) and
+  spaces stage commands by ≥ `settleTime_s + avgDuration_s` (≈ 5 s by
+  default). `settleTime_s` is floored at 0.3 s.
+- **`grabCurrentFrame` does not touch the MP-285** — the per-frame
+  `zNow_um` it returns comes from the FastZ piezo metadata
+  (`rd.zs`), not the manipulator.
+
+**Caveat — joystick desync.** Because we cache the position, if you move
+the stage with the MP-285 joystick (or any non-SI code) during a corrected
+acquisition, the cache will desync and the next correction will command a
+target based on the stale value. **Do not use the joystick during a
+corrected run.** Stop acquisition, reposition, then restart so
+`acqModeStart` can re-cache.
+
+If you ever need to disable corrections live without stopping acquisition:
+
+```matlab
+global MCORR_STATE; MCORR_STATE.enabled = false;
+```
+
+---
+
 ## 1. Why a v3?
 
 Both prior versions implement the same core scheme — a Z reference stack of
@@ -171,6 +216,8 @@ next, **rarely-touched** last.
 | `minNCC_buffer` | 0.30 | Frame admission gate. Lower if your reference plane NCC is intrinsically low. |
 | `minNCC_correction` | 0.50 | If real corrections are being skipped with "peak NCC < threshold", lower it. |
 | `maxShift_pix` | 50 | XY phase-correlation search radius. Increase if drift can exceed 50 px between corrections. |
+| `minMoveInterval_s` | 30 | Hard floor between MP-285 moves. Do **not** lower without understanding the lockup risk described in §0. |
+| `postMoveQuiet_s` | 0.5 | Pause after each `moveSample`. Increase if you ever see "controller busy" errors. |
 
 ### Things you do **not** need to set in v3 (gone vs. v2)
 

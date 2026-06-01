@@ -24,11 +24,16 @@ function motionCorrUserFcn(src, evt, varargin)
 %    8. Apply sign × gain, deadband, and per-axis clamp.
 %    9. Issue a single combined hSI.hMotors.moveSample command.
 %
+%  Axis mapping (scope-specific — MP-285 rotated 90° vs scan frame):
+%      image columns (X, dx_um) → motor Y
+%      image rows    (Y, dy_um) → motor X
+%
 %  Sign convention (after auto-/manually-set MCORR_STATE.[xyz]Sign):
-%      dz = -gainZ  * zEst  * zSign
-%      dy = -gainXY * dy_um * ySign
-%      dx = -gainXY * dx_um * xSign
-%  i.e. positive estimate (image/sample drifted +) → negative motor move.
+%      dz       = -gainZ  * zEst  * zSign      (zSign =+1)
+%      motorY   = -gainXY * dx_um * ySign      (ySign =-1, img-col → motor Y)
+%      motorX   = -gainXY * dy_um * xSign      (xSign =-1, img-row → motor X)
+%  With these signs, positive image drift produces a positive corrective
+%  motor command on the anti-parallel axis (reverses the drift).
 
 global MCORR_REF MCORR_STATE
 if isempty(MCORR_STATE) || ~MCORR_STATE.enabled || isempty(MCORR_REF), return; end
@@ -45,6 +50,22 @@ switch evt.EventName
         s.bufCount        = 0;
         s.zSeen           = [];
         s.cumCorr         = [0 0 0];
+        % --- MP285 safety: snapshot motor position ONCE while stage is
+        %     guaranteed idle. After this we never poll the controller
+        %     again; we only update the cache by the deltas we commanded.
+        try
+            s.cachedMotorPos = hSI.hMotors.motorPosition;
+            if s.verbose
+                fprintf('[MotionCorr] Cached initial motor pos:  X=%.2f Y=%.2f Z=%.2f µm\n', ...
+                    s.cachedMotorPos);
+            end
+        catch ME
+            s.cachedMotorPos = [];
+            warning('motionCorrUserFcn:posRead', ...
+                'Failed to read motorPosition at acqModeStart: %s\nMotion correction will be disabled this run.', ...
+                ME.message);
+            s.enabled = false;
+        end
         if s.verbose
             fprintf('[MotionCorr] Acquisition started — correction will begin after %.0f s.\n', ...
                 s.correctionInterval_s);
@@ -139,7 +160,12 @@ s.bufCount = min(s.bufCount + 1, s.bufferSize);
 % PHASE 2 — correction cycle
 % ================================================================
 if (tNow - s.tLastCorrection) < s.correctionInterval_s, MCORR_STATE = s; return; end
+% MP285 safety: hard floor on inter-command spacing, independent of
+% correctionInterval_s (which a user could lower unsafely).
+if (tNow - s.tLastCorrection) < s.minMoveInterval_s, MCORR_STATE = s; return; end
 if s.bufCount < s.minFramesForCorr,                     MCORR_STATE = s; return; end
+% Cannot command moves if we never got a baseline position.
+if isempty(s.cachedMotorPos),                            MCORR_STATE = s; return; end
 
 % Average frames whose timestamps fall within the last avgDuration_s
 mask = s.frameTimes(1:s.bufferSize) > (tNow - s.avgDuration_s) & ...
@@ -193,29 +219,39 @@ end
 % --- XY estimate: phase correlation vs best-matching Z reference -
 refImg = ref.featureImages{bi};
 [dy_pix, dx_pix] = phaseCorrShift(avgFrame, refImg, s.maxShift_pix);
-dx_um = dx_pix * ref.pixelSizeXY_um(1);    % cols → X
-dy_um = dy_pix * ref.pixelSizeXY_um(2);    % rows → Y
+dx_um = dx_pix * ref.pixelSizeXY_um(1);    % cols  → image X
+dy_um = dy_pix * ref.pixelSizeXY_um(2);    % rows  → image Y
 
 % --- Apply sign, gain, deadband, clamp --------------------------
+% NOTE: image cols (dx_um) drive motor Y; image rows (dy_um) drive motor X.
+% xSign/ySign are -1 on this scope (each image axis is anti-parallel to its
+% motor axis); zSign is +1.
 dz = clampDB( -s.gainZ  * zEst  * s.zSign,  s.deadband_z_um,  s.maxStep_z_um  );
-dy = clampDB( -s.gainXY * dy_um * s.ySign,  s.deadband_xy_um, s.maxStep_xy_um );
-dx = clampDB( -s.gainXY * dx_um * s.xSign,  s.deadband_xy_um, s.maxStep_xy_um );
+dy = clampDB( -s.gainXY * dx_um * s.ySign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-col → motorY
+dx = clampDB( -s.gainXY * dy_um * s.xSign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-row → motorX
 
 if s.verbose
-    fprintf('  Z: est %+.2f µm  cmd %+.2f  NCC=%.3f  ref %d/%d\n', zEst, dz, peakNCC, bi, ref.nZ);
-    fprintf('  Y: est %+.2f µm  cmd %+.2f  (%+.2f px)\n', dy_um, dy, dy_pix);
-    fprintf('  X: est %+.2f µm  cmd %+.2f  (%+.2f px)\n', dx_um, dx, dx_pix);
+    fprintf('  Z:      est %+.2f µm  cmd %+.2f  NCC=%.3f  ref %d/%d\n', zEst, dz, peakNCC, bi, ref.nZ);
+    fprintf('  motorY (imgX): est %+.2f µm  cmd %+.2f  (%+.2f px)\n', dx_um, dy, dx_pix);
+    fprintf('  motorX (imgY): est %+.2f µm  cmd %+.2f  (%+.2f px)\n', dy_um, dx, dy_pix);
 end
 
 % --- Move stage --------------------------------------------------
 if abs(dx)+abs(dy)+abs(dz) > 0
     try
-        pos = hSI.hMotors.motorPosition;
-        pos(1) = pos(1) + dx;
-        pos(2) = pos(2) + dy;
-        pos(3) = pos(3) + dz;
-        hSI.hMotors.moveSample(pos);
-        s.cumCorr = s.cumCorr + [dx dy dz];
+        % MP285 safety: do NOT query motorPosition here. Use the cached
+        % position (snapshot at acqModeStart, incremented by every
+        % commanded delta). Querying the controller is exactly what the
+        % ScanImage docs warn can lock it up.
+        pos    = s.cachedMotorPos;
+        newPos = pos + [dx dy dz];
+        hSI.hMotors.moveSample(newPos);
+        % Post-move quiet period: guarantee the controller has settled
+        % before any other code path (incl. the next frameAcquired
+        % callback) can touch the serial port.
+        if s.postMoveQuiet_s > 0, pause(s.postMoveQuiet_s); end
+        s.cachedMotorPos = newPos;        % only update on success
+        s.cumCorr        = s.cumCorr + [dx dy dz];
         if s.verbose
             fprintf('  motor moved  X%+.2f Y%+.2f Z%+.2f µm  | cumulative X%+.1f Y%+.1f Z%+.1f\n', ...
                 dx, dy, dz, s.cumCorr);

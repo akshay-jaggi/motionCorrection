@@ -17,11 +17,12 @@ title(sprintf('z = %.2f µm   min %.0f  max %.0f', z, min(img(:)), max(img(:))))
 %% 2) Acquire reference Z stack (a few minutes)
 %    Use the channel with the most invariant structural signal.
 refStack = acquireRefStack(hSI, ...
-    'channel',         2, ...     % structural / red
-    'zRange_um',       12, ...    % ±12 µm around current plane
+    'channel',         2, ...          % structural / red
+    'zRange_um',       12, ...         % ±12 µm around current plane
     'zStep_um',        1, ...
     'avgDuration_s',   5, ...
-    'useFeatureImage', true);     % robust to activity
+    'useFeatureImage', true, ...       % robust to activity
+    'pixelSizeXY_um',  [1.3125 1.3125]);  % 672 µm FOV / 512 px
 
 hSI.abort();                      % leave focus mode
 
@@ -39,7 +40,16 @@ setupMotionCorrection(hSI, refStack, ...
     'maxStep_z_um',         3, ...
     'maxStep_xy_um',        5, ...
     'gainXY',               0.7, ...
-    'gainZ',                0.5);
+    'gainZ',                0.5, ...
+    % --- scope-specific axis calibration ----------------------------
+    % Image cols (X) map to motor Y; image rows (Y) map to motor X.
+    % Both image axes are anti-parallel to their motor counterpart:
+    %   +image_x drift → motor_y decreased  → correct with +motor_y  → ySign=-1
+    %   +image_y drift → motor_x decreased  → correct with +motor_x  → xSign=-1
+    %   +z-stack shift → motor_z increased  → correct with -motor_z  → zSign=+1
+    'xSign',               -1, ...
+    'ySign',               -1, ...
+    'zSign',                1);
 
 %% 5) Attach motionCorrUserFcn as a ScanImage USER FUNCTION on:
 %      acqModeStart, acqModeDone, frameAcquired
