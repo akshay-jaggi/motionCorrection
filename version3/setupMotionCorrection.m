@@ -19,7 +19,7 @@ function setupMotionCorrection(hSI, refStack, varargin)
 %  'minNCC_buffer'                0.30      Frame admission NCC threshold
 %  'minNCC_correction'            0.50      Minimum NCC to trust Z estimate
 %  'minFramesForCorr'             10        Require ≥ N frames before first corr.
-%  'deadband_z_um'                1.5       Z deadband (µm)
+%  'deadband_z_um'                2         Z deadband (µm)
 %  'deadband_xy_um'               1.0       XY deadband per axis (µm)
 %  'maxStep_z_um'                 3         Z max single move (µm)
 %  'maxStep_xy_um'                5         XY max single move per axis (µm)
@@ -70,7 +70,7 @@ addParameter(p,'avgDuration_s',       5,    @isnumeric);
 addParameter(p,'minNCC_buffer',       0.30, @isnumeric);
 addParameter(p,'minNCC_correction',   0.50, @isnumeric);
 addParameter(p,'minFramesForCorr',    10,   @isnumeric);
-addParameter(p,'deadband_z_um',       1.5,  @isnumeric);
+addParameter(p,'deadband_z_um',       2,    @isnumeric);
 addParameter(p,'deadband_xy_um',      1.0,  @isnumeric);
 addParameter(p,'maxStep_z_um',        3,    @isnumeric);
 addParameter(p,'maxStep_xy_um',       5,    @isnumeric);
