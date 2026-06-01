@@ -350,8 +350,8 @@ if trustZ
 else
     dz = 0;
 end
-dy = clampDB( -s.gainXY * dx_um * s.ySign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-col → motorY
-dx = clampDB( -s.gainXY * dy_um * s.xSign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-row → motorX
+dy = clampDB( -s.gainXY * dy_um * s.ySign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-col → motorY (trying a reflip)
+dx = clampDB( -s.gainXY * dx_um * s.xSign,  s.deadband_xy_um, s.maxStep_xy_um );  % img-row → motorX (trying a reflip)
 
 % --- Anti-oscillation guard (Z only) ---------------------------
 % If the previous Z move was clamped at max AND this cycle wants to
