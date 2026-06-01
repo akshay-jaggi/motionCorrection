@@ -46,7 +46,7 @@ function setupMotionCorrection(hSI, refStack, varargin)
 %  disabled its own live position updates for this device.
 %
 %  This implementation mitigates that as follows:
-%    * motorPosition is queried EXACTLY ONCE per acquisition (at acqModeStart,
+%    * samplePosition is queried EXACTLY ONCE per acquisition (at acqModeStart,
 %      when the stage is guaranteed idle). The position is then cached in
 %      MCORR_STATE.cachedMotorPos and incremented by the commanded delta after
 %      each successful moveSample. No further position queries are issued.

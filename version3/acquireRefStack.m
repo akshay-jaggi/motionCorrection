@@ -23,7 +23,7 @@ function refStack = acquireRefStack(hSI, varargin)
 %   - Frames available on requested channel (verify with grabCurrentFrame).
 %
 %  MP-285 SAFETY
-%   - motorPosition is queried EXACTLY ONCE (at the start, while the stage
+%   - samplePosition is queried EXACTLY ONCE (at the start, while the stage
 %     is idle). All subsequent stage targets are computed as basePos+offset
 %     — we never poll the controller during the stack acquisition.
 %   - moveSample commands are spaced by at least settleTime_s +
@@ -66,7 +66,7 @@ end
 
 zOffsets = -o.zRange_um : o.zStep_um : o.zRange_um;
 nZ       = numel(zOffsets);
-basePos  = hSI.hMotors.motorPosition;            % [X Y Z] µm
+basePos  = hSI.hMotors.samplePosition;           % [X Y Z] µm
 scanFR   = hSI.hRoiManager.scanFrameRate;
 framePer = 1/scanFR;
 

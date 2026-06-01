@@ -54,7 +54,7 @@ switch evt.EventName
         %     guaranteed idle. After this we never poll the controller
         %     again; we only update the cache by the deltas we commanded.
         try
-            s.cachedMotorPos = hSI.hMotors.motorPosition;
+            s.cachedMotorPos = hSI.hMotors.samplePosition;
             if s.verbose
                 fprintf('[MotionCorr] Cached initial motor pos:  X=%.2f Y=%.2f Z=%.2f µm\n', ...
                     s.cachedMotorPos);
@@ -62,7 +62,7 @@ switch evt.EventName
         catch ME
             s.cachedMotorPos = [];
             warning('motionCorrUserFcn:posRead', ...
-                'Failed to read motorPosition at acqModeStart: %s\nMotion correction will be disabled this run.', ...
+                'Failed to read samplePosition at acqModeStart: %s\nMotion correction will be disabled this run.', ...
                 ME.message);
             s.enabled = false;
         end
@@ -239,7 +239,7 @@ end
 % --- Move stage --------------------------------------------------
 if abs(dx)+abs(dy)+abs(dz) > 0
     try
-        % MP285 safety: do NOT query motorPosition here. Use the cached
+        % MP285 safety: do NOT query samplePosition here. Use the cached
         % position (snapshot at acqModeStart, incremented by every
         % commanded delta). Querying the controller is exactly what the
         % ScanImage docs warn can lock it up.

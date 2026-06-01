@@ -19,7 +19,7 @@ The ScanImage docs carry an explicit warning for the
 
 v3 is built to respect this. Concretely:
 
-- **`motorPosition` is queried exactly once per acquisition**, at
+- **`samplePosition` is queried exactly once per acquisition**, at
   `acqModeStart`, while the stage is guaranteed idle. The position is then
   cached in `MCORR_STATE.cachedMotorPos` and incremented by each commanded
   delta. The controller is never polled during steady-state imaging.
@@ -123,7 +123,7 @@ is mounted relative to the scan/objective coordinate frame. Two methods:
 1. In single-plane FOCUS, image a recognisable feature near image centre.
 2. Move the stage by a small known amount along **X** only:
    ```matlab
-   p = hSI.hMotors.motorPosition;
+   p = hSI.hMotors.samplePosition;
    hSI.hMotors.moveSample(p + [+5 0 0]);    % +5 µm in motor X
    ```
 3. Observe the image: did features shift left, right, up, or down?
