@@ -35,7 +35,7 @@ function motionCorrUserFcn(src, evt, varargin)
 %  With these signs, positive image drift produces a positive corrective
 %  motor command on the anti-parallel axis (reverses the drift).
 
-global MCORR_REF MCORR_STATE MCORR_FRAMEBUF MCORR_FRAMETIMES
+global MCORR_REF MCORR_STATE MCORR_FRAMEBUF MCORR_FRAMETIMES MCORR_DIAG
 if isempty(MCORR_STATE) || ~MCORR_STATE.enabled || isempty(MCORR_REF), return; end
 
 hSI = src.hSI;
@@ -51,25 +51,27 @@ switch evt.EventName
         s.bufCount        = 0;
         s.zSeen           = [];
         s.cumCorr         = [0 0 0];
-        % --- MP285 safety: snapshot motor position ONCE while stage is
-        %     guaranteed idle. After this we never poll the controller
-        %     again; we only update the cache by the deltas we commanded.
-        try
-            s.cachedMotorPos = hSI.hMotors.samplePosition;
-            if s.verbose
-                fprintf('[MotionCorr] Cached initial motor pos:  X=%.2f Y=%.2f Z=%.2f µm\n', ...
-                    s.cachedMotorPos);
-            end
-        catch ME
-            s.cachedMotorPos = [];
-            warning('motionCorrUserFcn:posRead', ...
-                'Failed to read samplePosition at acqModeStart: %s\nMotion correction will be disabled this run.', ...
-                ME.message);
+        % NOTE: samplePosition is NOT queried here. It was cached during
+        % setupMotionCorrection (stage idle, no SI pressure). Querying the
+        % MP-285 inside acqModeStart can take 100s of ms and delays SI's
+        % own pipeline init, causing the first frame to drop.
+        if isempty(s.cachedMotorPos)
+            warning('motionCorrUserFcn:noBase', ...
+                'No cached motor position. Re-run setupMotionCorrection while stage is idle.');
             s.enabled = false;
         end
+        if s.diag
+            MCORR_DIAG.nFrames     = 0;
+            MCORR_DIAG.nProcessed  = 0;
+            MCORR_DIAG.idx         = 0;
+            MCORR_DIAG.peakTotal_ms= 0;
+            MCORR_DIAG.peakWhen    = 0;
+        end
         if s.verbose
-            fprintf('[MotionCorr] Acquisition started — correction will begin after %.0f s.\n', ...
-                s.correctionInterval_s);
+            fprintf('[MotionCorr] Acquisition started%s\n', ...
+                ternary_(s.dryRun, ' (DRY RUN — no stage moves)', ''));
+            fprintf('[MotionCorr]   first correction in ~%.0f s; per-frame work only in last %.1f s of each interval.\n', ...
+                s.correctionInterval_s, s.avgDuration_s + s.collectMargin_s);
         end
         MCORR_STATE = s; return;
 
@@ -77,6 +79,22 @@ switch evt.EventName
         if s.verbose
             fprintf('[MotionCorr] Acquisition ended.  Cumulative correction:  X%+.1f  Y%+.1f  Z%+.1f µm\n', ...
                 s.cumCorr);
+        end
+        if s.diag && ~isempty(MCORR_DIAG) && MCORR_DIAG.idx > 0
+            n = min(MCORR_DIAG.idx, numel(MCORR_DIAG.tTotal));
+            fprintf(['[MotionCorr]   diagnostics:  %d frames seen, %d processed past gate\n' ...
+                     '                 last %d processed-frame timings (ms):\n' ...
+                     '                   grab    : mean %.2f  max %.2f\n' ...
+                     '                   feature : mean %.2f  max %.2f\n' ...
+                     '                   buffer  : mean %.2f  max %.2f\n' ...
+                     '                   TOTAL   : mean %.2f  max %.2f\n' ...
+                     '                 peak callback ever: %.2f ms at t=%.1fs\n'], ...
+                MCORR_DIAG.nFrames, MCORR_DIAG.nProcessed, n, ...
+                1e3*mean(MCORR_DIAG.tGrab(1:n)),    1e3*max(MCORR_DIAG.tGrab(1:n)), ...
+                1e3*mean(MCORR_DIAG.tFeature(1:n)), 1e3*max(MCORR_DIAG.tFeature(1:n)), ...
+                1e3*mean(MCORR_DIAG.tBuffer(1:n)),  1e3*max(MCORR_DIAG.tBuffer(1:n)), ...
+                1e3*mean(MCORR_DIAG.tTotal(1:n)),   1e3*max(MCORR_DIAG.tTotal(1:n)), ...
+                MCORR_DIAG.peakTotal_ms, MCORR_DIAG.peakWhen);
         end
         MCORR_STATE = s; return;
 
@@ -88,10 +106,44 @@ switch evt.EventName
 end
 
 % ================================================================
-% PHASE 1 — frame intake
+% FAST PATH — collection window gate
 % ================================================================
+% Skip ALL per-frame work outside the collection window leading up to
+% the next correction. Default reduces processed frames by ~12×.
+% This is intentionally placed BEFORE grabCurrentFrame so the callback
+% returns in microseconds for ~92% of frames.
+if s.diag
+    tCallback0 = tic;
+    MCORR_DIAG.nFrames = MCORR_DIAG.nFrames + 1;
+    if MCORR_DIAG.nFrames <= 3
+        % Skip the first 3 frames entirely — SI pipeline is still warming.
+        MCORR_STATE = s; return;
+    end
+else
+    if s.bufCount == 0 && s.bufIdx == 0
+        % no-op (kept symmetric)
+    end
+end
+
+tNow_approx       = toc(s.tRef);
+timeUntilNextCorr = s.correctionInterval_s - (tNow_approx - s.tLastCorrection);
+inCollectWindow   = timeUntilNextCorr <= (s.avgDuration_s + s.collectMargin_s);
+if ~inCollectWindow
+    MCORR_STATE = s; return;   % fast path — nothing else runs
+end
+
+% ================================================================
+% PHASE 1 — frame intake (only runs inside collection window)
+% ================================================================
+if s.diag, tPhase = tic; end
 [frame, zNow_um, ok] = grabCurrentFrame(hSI, ref.channel);
-if ~ok, return; end
+if s.diag
+    tGrab = toc(tPhase);
+end
+if ~ok
+    if s.diag, logDiag_(MCORR_DIAG, tGrab, 0, 0, toc(tCallback0), tNow_approx); end
+    return;
+end
 
 % Auto-detect target plane Z if not specified
 if isempty(s.targetPlaneZ_um)
@@ -128,26 +180,38 @@ if ~isempty(s.targetPlaneZ_um) && ~isnan(zNow_um)
 end
 
 % Crop + (optional) feature image for matching
+if s.diag, tPhase = tic; end
 crop = frame(ref.rIdx, ref.cIdx);
 if ref.useFeatureImage
     feat = featureImage(crop);
 else
     feat = crop;
 end
+if s.diag, tFeature = toc(tPhase); tPhase = tic; end
 fv = single(feat(:));
 fv = fv - mean(fv);
 nv = norm(fv);
-if nv < 1e-6, MCORR_STATE = s; return; end
+if nv < 1e-6
+    if s.diag
+        tBuffer = toc(tPhase);
+        logDiag_(MCORR_DIAG, tGrab, tFeature, tBuffer, toc(tCallback0), tNow_approx);
+    end
+    MCORR_STATE = s; return;
+end
 fvN = fv / nv;
 
 % NCC gate: is this frame really at the reference plane?
 gateNCC = ref.refFlat(:, ref.zeroIdx)' * fvN;
 if gateNCC < s.minNCC_buffer
+    if s.diag
+        tBuffer = toc(tPhase);
+        logDiag_(MCORR_DIAG, tGrab, tFeature, tBuffer, toc(tCallback0), tNow_approx);
+    end
     MCORR_STATE = s; return;
 end
 
 % Push to ring buffer (store the cropped feature, not the full raw frame)
-tNow = toc(s.tRef);
+tNow = tNow_approx;
 s.bufIdx   = mod(s.bufIdx, s.bufferSize) + 1;
 % Resize global buffer on first use if feature image is smaller than imSize
 % (should only happen once per session after first valid frame)
@@ -159,6 +223,10 @@ end
 MCORR_FRAMEBUF(:,:,s.bufIdx) = feat;
 MCORR_FRAMETIMES(s.bufIdx)   = tNow;
 s.bufCount = min(s.bufCount + 1, s.bufferSize);
+if s.diag
+    tBuffer = toc(tPhase);
+    logDiag_(MCORR_DIAG, tGrab, tFeature, tBuffer, toc(tCallback0), tNow);
+end
 
 % ================================================================
 % PHASE 2 — correction cycle
@@ -246,26 +314,33 @@ end
 
 % --- Move stage --------------------------------------------------
 if abs(dx)+abs(dy)+abs(dz) > 0
-    try
-        % MP285 safety: do NOT query samplePosition here. Use the cached
-        % position (snapshot at acqModeStart, incremented by every
-        % commanded delta). Querying the controller is exactly what the
-        % ScanImage docs warn can lock it up.
-        pos    = s.cachedMotorPos;
-        newPos = pos + [dx dy dz];
-        hSI.hMotors.moveSample(newPos);
-        % Record move timestamp for the non-blocking quiet-period gate
-        % at the top of Phase 2. Do NOT pause() here — blocking inside
-        % a frameAcquired callback causes ScanImage frame drops.
-        s.tLastMove      = tNow;
-        s.cachedMotorPos = newPos;        % only update on success
-        s.cumCorr        = s.cumCorr + [dx dy dz];
+    if s.dryRun
         if s.verbose
-            fprintf('  motor moved  X%+.2f Y%+.2f Z%+.2f µm  | cumulative X%+.1f Y%+.1f Z%+.1f\n', ...
-                dx, dy, dz, s.cumCorr);
+            fprintf('  [DRY RUN] would move X%+.2f Y%+.2f Z%+.2f µm — not commanded.\n', dx, dy, dz);
         end
-    catch ME
-        warning('motionCorrUserFcn:move', '%s', ME.message);
+        s.tLastMove = tNow;   % still respect quiet-period gate
+    else
+        try
+            % MP285 safety: do NOT query samplePosition here. Use the cached
+            % position (snapshot at setup, incremented by every commanded
+            % delta). Querying the controller is exactly what the ScanImage
+            % docs warn can lock it up.
+            pos    = s.cachedMotorPos;
+            newPos = pos + [dx dy dz];
+            hSI.hMotors.moveSample(newPos);
+            % Record move timestamp for the non-blocking quiet-period gate
+            % at the top of Phase 2. Do NOT pause() here — blocking inside
+            % a frameAcquired callback causes ScanImage frame drops.
+            s.tLastMove      = tNow;
+            s.cachedMotorPos = newPos;        % only update on success
+            s.cumCorr        = s.cumCorr + [dx dy dz];
+            if s.verbose
+                fprintf('  motor moved  X%+.2f Y%+.2f Z%+.2f µm  | cumulative X%+.1f Y%+.1f Z%+.1f\n', ...
+                    dx, dy, dz, s.cumCorr);
+            end
+        catch ME
+            warning('motionCorrUserFcn:move', '%s', ME.message);
+        end
     end
 elseif s.verbose
     fprintf('  all within deadband — no move.\n');
@@ -279,6 +354,32 @@ end
 % =========================================================================
 function v = clampDB(v, db, maxV)
 if abs(v) < db, v = 0; else, v = sign(v)*min(abs(v),maxV); end
+end
+
+
+% =========================================================================
+function logDiag_(~, tGrab, tFeature, tBuffer, tTotal, tWhen)
+% Append timings to MCORR_DIAG ring buffer (last 200 processed frames)
+% and update the peak-callback tracker. Direct globals avoid COW.
+global MCORR_DIAG
+if isempty(MCORR_DIAG), return; end
+N = numel(MCORR_DIAG.tTotal);
+MCORR_DIAG.idx        = mod(MCORR_DIAG.idx, N) + 1;
+MCORR_DIAG.nProcessed = MCORR_DIAG.nProcessed + 1;
+MCORR_DIAG.tGrab(MCORR_DIAG.idx)    = single(tGrab);
+MCORR_DIAG.tFeature(MCORR_DIAG.idx) = single(tFeature);
+MCORR_DIAG.tBuffer(MCORR_DIAG.idx)  = single(tBuffer);
+MCORR_DIAG.tTotal(MCORR_DIAG.idx)   = single(tTotal);
+if 1e3*tTotal > MCORR_DIAG.peakTotal_ms
+    MCORR_DIAG.peakTotal_ms = 1e3*tTotal;
+    MCORR_DIAG.peakWhen     = tWhen;
+end
+end
+
+
+% =========================================================================
+function s = ternary_(c, a, b)
+if c, s = a; else, s = b; end
 end
 
 

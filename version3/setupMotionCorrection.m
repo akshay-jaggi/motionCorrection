@@ -61,7 +61,7 @@ function setupMotionCorrection(hSI, refStack, varargin)
 %  Do not use the joystick during a corrected run; stop/restart acquisition
 %  if you need to reposition manually.
 
-global MCORR_REF MCORR_STATE MCORR_FRAMEBUF MCORR_FRAMETIMES
+global MCORR_REF MCORR_STATE MCORR_FRAMEBUF MCORR_FRAMETIMES MCORR_DIAG
 
 p = inputParser;
 addParameter(p,'targetPlaneZ_um',     [],   @(x) isempty(x)||isnumeric(x));
@@ -82,6 +82,9 @@ addParameter(p,'ySign',               1,    @isnumeric);
 addParameter(p,'zSign',               1,    @isnumeric);
 addParameter(p,'minMoveInterval_s',   30,   @(x) isnumeric(x) && x >= 0);
 addParameter(p,'postMoveQuiet_s',     0.5,  @(x) isnumeric(x) && x >= 0);
+addParameter(p,'collectMargin_s',     2,    @(x) isnumeric(x) && x >= 0);
+addParameter(p,'dryRun',              false,@islogical);
+addParameter(p,'diag',                true, @islogical);
 addParameter(p,'verbose',             true, @islogical);
 parse(p, varargin{:});
 o = p.Results;
@@ -124,6 +127,9 @@ MCORR_STATE = struct( ...
     'zSign',                o.zSign, ...
     'minMoveInterval_s',    o.minMoveInterval_s, ...
     'postMoveQuiet_s',      o.postMoveQuiet_s, ...
+    'collectMargin_s',      o.collectMargin_s, ...
+    'dryRun',               o.dryRun, ...
+    'diag',                 o.diag, ...
     'tLastMove',           -inf, ...   % timestamp of last moveSample;
                                        % Phase 2 is suppressed for
                                        % postMoveQuiet_s after each move
@@ -140,6 +146,32 @@ MCORR_STATE = struct( ...
 % "Data logging lags behind acquisition" frame-drop error.
 MCORR_FRAMEBUF   = zeros([refStack.imSize, bufSize], 'single');
 MCORR_FRAMETIMES = zeros(1, bufSize);
+
+% Cache the initial sample position NOW (stage is idle, no SI pressure)
+% rather than during acqModeStart. The MP-285 serial round-trip can take
+% hundreds of milliseconds and inside acqModeStart this delays SI's own
+% pipeline init, which can drop the first frame.
+try
+    MCORR_STATE.cachedMotorPos = hSI.hMotors.samplePosition;
+    fprintf('  Cached initial pos: X=%.2f Y=%.2f Z=%.2f µm\n', MCORR_STATE.cachedMotorPos);
+catch ME
+    warning('setupMotionCorrection:posRead', ...
+        'Failed to read samplePosition: %s\nMotion correction will be disabled until you retry setup.', ...
+        ME.message);
+    MCORR_STATE.enabled = false;
+end
+
+% Diagnostics ring-buffer for per-phase timing (filled by the callback).
+MCORR_DIAG = struct( ...
+    'nFrames',       0, ...
+    'nProcessed',    0, ...    % frames that got past the collection-window gate
+    'tGrab',         zeros(1,200,'single'), ...  % last 200 frames
+    'tFeature',      zeros(1,200,'single'), ...
+    'tBuffer',       zeros(1,200,'single'), ...
+    'tTotal',        zeros(1,200,'single'), ...
+    'idx',           0, ...
+    'peakTotal_ms',  0, ...
+    'peakWhen',      0);
 
 % JIT pre-warm: call featureImage once now so MATLAB compiles the
 % imgaussfilt/imgradient path before the first frameAcquired fires.
@@ -163,7 +195,11 @@ fprintf('  Gains       : XY=%.2f  Z=%.2f       Signs: X=%+d Y=%+d Z=%+d\n', ...
     o.gainXY, o.gainZ, o.xSign, o.ySign, o.zSign);
 fprintf('  MP285 safety: min %g s between moves, %g s post-move quiet\n', ...
     o.minMoveInterval_s, o.postMoveQuiet_s);
-fprintf('  Buffer      : %d slots\n', bufSize);
+fprintf('  Buffer      : %d slots   Collection window: last %.1f s before each correction\n', ...
+    bufSize, o.avgDuration_s + o.collectMargin_s);
+if o.dryRun
+    fprintf('  *** DRY RUN MODE *** computes everything but never moves stage.\n');
+end
 fprintf('  Now attach motionCorrUserFcn to:\n');
 fprintf('     acqModeStart, acqModeDone, frameAcquired\n');
 fprintf('  To stop:       global MCORR_STATE; MCORR_STATE.enabled = false;\n');
