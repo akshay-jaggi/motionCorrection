@@ -126,10 +126,22 @@ MCORR_STATE = struct( ...
     'zSign',                o.zSign, ...
     'minMoveInterval_s',    o.minMoveInterval_s, ...
     'postMoveQuiet_s',      o.postMoveQuiet_s, ...
-    'cachedMotorPos',       [], ...   % populated at acqModeStart, then
+    'tLastMove',           -inf, ...   % timestamp of last moveSample;
+                                       % Phase 2 is suppressed for
+                                       % postMoveQuiet_s after each move
+    'cachedMotorPos',       [], ...    % populated at acqModeStart, then
                                        % incremented by each commanded move
     'verbose',              o.verbose, ...
     'cumCorr',              [0 0 0]);
+
+% JIT pre-warm: call featureImage once now so MATLAB compiles the
+% imgaussfilt/imgradient path before the first frameAcquired fires.
+% Without this the very first callback invocation is ~10x slower and
+% can cause ScanImage to drop a frame.
+if refStack.rIdx && refStack.cIdx
+    dummy = zeros(numel(refStack.rIdx), numel(refStack.cIdx), 'single');
+    jitWarm_(dummy, refStack.useFeatureImage);
+end
 
 fprintf('=== XYZ Motion Correction CONFIGURED ===\n');
 fprintf('  Reference   : %d planes, ±%g µm, ch %d, pixel [%.3f %.3f] µm/px\n', ...
@@ -153,4 +165,20 @@ end
 
 function s = ternary(c, a, b)
 if c, s = a; else, s = b; end
+end
+
+function jitWarm_(dummy, useFeatureImage)
+% Force MATLAB to JIT-compile the feature image pipeline used in the
+% frameAcquired callback so the first live frame doesn't stall.
+if useFeatureImage
+    try
+        x = dummy;
+        x = x - imgaussfilt(x, 6);
+        x = imgaussfilt(x, 1);
+        imgradient(x);
+    catch
+        [gx, gy] = gradient(double(dummy));
+        sqrt(gx.^2 + gy.^2); %#ok<VUNUS>
+    end
+end
 end

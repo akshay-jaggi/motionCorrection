@@ -46,6 +46,7 @@ switch evt.EventName
     case 'acqModeStart'
         s.tRef            = tic;
         s.tLastCorrection = -inf;
+        s.tLastMove       = -inf;
         s.bufIdx          = 0;
         s.bufCount        = 0;
         s.zSeen           = [];
@@ -162,8 +163,13 @@ s.bufCount = min(s.bufCount + 1, s.bufferSize);
 if (tNow - s.tLastCorrection) < s.correctionInterval_s, MCORR_STATE = s; return; end
 % MP285 safety: hard floor on inter-command spacing, independent of
 % correctionInterval_s (which a user could lower unsafely).
-if (tNow - s.tLastCorrection) < s.minMoveInterval_s, MCORR_STATE = s; return; end
-if s.bufCount < s.minFramesForCorr,                     MCORR_STATE = s; return; end
+if (tNow - s.tLastCorrection) < s.minMoveInterval_s,    MCORR_STATE = s; return; end
+% Non-blocking post-move quiet period: suppress the next correction
+% for postMoveQuiet_s after a moveSample so the controller settles.
+% (Never use pause() inside a frameAcquired callback — it blocks
+% ScanImage's acquisition pipeline and causes frame drops.)
+if (tNow - s.tLastMove) < s.postMoveQuiet_s,             MCORR_STATE = s; return; end
+if s.bufCount < s.minFramesForCorr,                      MCORR_STATE = s; return; end
 % Cannot command moves if we never got a baseline position.
 if isempty(s.cachedMotorPos),                            MCORR_STATE = s; return; end
 
@@ -246,10 +252,10 @@ if abs(dx)+abs(dy)+abs(dz) > 0
         pos    = s.cachedMotorPos;
         newPos = pos + [dx dy dz];
         hSI.hMotors.moveSample(newPos);
-        % Post-move quiet period: guarantee the controller has settled
-        % before any other code path (incl. the next frameAcquired
-        % callback) can touch the serial port.
-        if s.postMoveQuiet_s > 0, pause(s.postMoveQuiet_s); end
+        % Record move timestamp for the non-blocking quiet-period gate
+        % at the top of Phase 2. Do NOT pause() here — blocking inside
+        % a frameAcquired callback causes ScanImage frame drops.
+        s.tLastMove      = tNow;
         s.cachedMotorPos = newPos;        % only update on success
         s.cumCorr        = s.cumCorr + [dx dy dz];
         if s.verbose
